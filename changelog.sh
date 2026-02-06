@@ -282,7 +282,7 @@ log "Collecting commits ${FROM_REF}..${TO_REF}"
 
 while IFS='|' read -r hash short_hash author email date subject; do
     [[ -z "$hash" ]] && continue
-    ((TOTAL_COMMITS++))
+    ((++TOTAL_COMMITS))
 
     category=$(categorize_commit "$subject")
     scope_info=$(classify_commit_scope "$hash")

@@ -129,7 +129,7 @@ while IFS='|' read -r hash short_hash author email date subject; do
         echo "  EMPTY hash on iteration $count"
         continue
     fi
-    ((count++))
+    ((++count))
     if [[ $count -le 3 ]]; then
         echo "  [$count] $short_hash - $subject"
     fi
@@ -151,7 +151,7 @@ while IFS='|' read -r hash short_hash author email date subject; do
         echo "  EMPTY hash on iteration $count"
         continue
     fi
-    ((count++))
+    ((++count))
     if [[ $count -le 3 ]]; then
         echo "  [$count] $short_hash - $subject"
     fi
@@ -188,7 +188,7 @@ categorize_simple() {
 count=0
 while IFS='|' read -r hash short_hash author email date subject; do
     [[ -z "$hash" ]] && continue
-    ((count++))
+    ((++count))
 
     category=$(categorize_simple "$subject")
     commit_line="${short_hash}|${author}|${date}|${subject}"

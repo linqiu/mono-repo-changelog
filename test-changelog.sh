@@ -258,7 +258,7 @@ echo ""
 loop_count=0
 while IFS='|' read -r hash short_hash author email date subject; do
     [[ -z "$hash" ]] && continue
-    ((loop_count++))
+    ((++loop_count))
     if [[ $loop_count -le 3 ]]; then
         echo "  Iteration $loop_count: $short_hash - $subject"
     fi
@@ -295,7 +295,7 @@ get_commits_test() {
 ps_count=0
 while IFS='|' read -r hash short_hash author email date subject; do
     [[ -z "$hash" ]] && continue
-    ((ps_count++))
+    ((++ps_count))
 done < <(get_commits_test)
 
 echo "Commits processed via process substitution: $ps_count"
