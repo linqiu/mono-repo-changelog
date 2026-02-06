@@ -1,0 +1,195 @@
+# .github/workflows/shared-change-build.yml
+#
+# Triggered when shared packages change. Automatically detects affected
+# services and builds only those, then generates a changelog.
+
+name: Shared Dependency Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'shared/**'
+      - 'pkg/**'
+      - 'internal/common/**'
+
+  # Allow manual trigger with optional scope override
+  workflow_dispatch:
+    inputs:
+      force_services:
+        description: 'Comma-separated services to force build (empty = auto-detect)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Adjust to your org/repo
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Step 1: Detect which services are affected
+  # ──────────────────────────────────────────────
+  detect:
+    name: Detect affected services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.blast.outputs.services }}
+      has_affected: ${{ steps.blast.outputs.has_affected }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for accurate diffing
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run blast radius analysis
+        id: blast
+        run: |
+          chmod +x ./scripts/blast-radius.sh
+
+          if [[ -n "${{ inputs.force_services }}" ]]; then
+            # Manual override — build specified services
+            services=$(echo '${{ inputs.force_services }}' | jq -R 'split(",") | map(. | gsub("^\\s+|\\s+$"; ""))')
+            echo "services=$services" >> $GITHUB_OUTPUT
+            echo "has_affected=true" >> $GITHUB_OUTPUT
+            echo "::notice::Forced build for: ${{ inputs.force_services }}"
+          else
+            # Auto-detect using blast radius
+            services=$(./scripts/blast-radius.sh \
+              --base "${{ github.event.before }}" \
+              --head "${{ github.sha }}" \
+              --format json \
+              --verbose)
+
+            echo "services=$services" >> $GITHUB_OUTPUT
+
+            if [[ "$services" == "[]" ]]; then
+              echo "has_affected=false" >> $GITHUB_OUTPUT
+              echo "::notice::No services affected by shared changes"
+            else
+              echo "has_affected=true" >> $GITHUB_OUTPUT
+              echo "::notice::Affected services: $services"
+            fi
+          fi
+
+      - name: Show detailed impact (for PR review)
+        if: steps.blast.outputs.has_affected == 'true'
+        run: |
+          echo "### Blast Radius Detail"
+          ./scripts/blast-radius.sh \
+            --base "${{ github.event.before }}" \
+            --head "${{ github.sha }}" \
+            --format detail \
+            --verbose
+
+  # ──────────────────────────────────────────────
+  # Step 2: Build affected service images
+  # ──────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.service }}
+    needs: detect
+    if: needs.detect.outputs.has_affected == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect.outputs.services) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build metadata
+        id: meta
+        run: |
+          # Generate image tag from short SHA + timestamp
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TIMESTAMP=$(date '+%Y%m%d%H%M%S')
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+
+          echo "image=${{ env.IMAGE_PREFIX }}/${{ matrix.service }}" >> $GITHUB_OUTPUT
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./services/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ──────────────────────────────────────────────
+  # Step 3: Generate changelog
+  # ──────────────────────────────────────────────
+  changelog:
+    name: Generate changelog
+    needs: [detect, build]
+    if: needs.detect.outputs.has_affected == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate per-service changelogs
+        run: |
+          chmod +x ./scripts/changelog.sh
+          mkdir -p /tmp/changelogs
+
+          services='${{ needs.detect.outputs.services }}'
+          echo "$services" | jq -r '.[]' | while read -r svc; do
+            echo "::group::Changelog for $svc"
+
+            ./scripts/changelog.sh \
+              --service "$svc" \
+              --from "${{ github.event.before }}" \
+              --to "${{ github.sha }}" \
+              --format markdown \
+              > "/tmp/changelogs/${svc}.md"
+
+            cat "/tmp/changelogs/${svc}.md"
+            echo "::endgroup::"
+          done
+
+      - name: Post changelog as job summary
+        run: |
+          echo "# 🔄 Shared Dependency Change Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** \`${{ github.event.before }}\` → \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for changelog in /tmp/changelogs/*.md; do
+            cat "$changelog" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Upload changelogs
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelogs
+          path: /tmp/changelogs/
+          retention-days: 90

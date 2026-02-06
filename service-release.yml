@@ -1,0 +1,141 @@
+# .github/workflows/service-release.yml
+#
+# Triggered when a per-service tag is pushed (e.g., billing/v1.2.3).
+# Builds the service image, generates a changelog since the last tag,
+# and creates a GitHub release.
+
+name: Service Release
+
+on:
+  push:
+    tags:
+      - '*/v*'   # matches billing/v1.2.3, ingestion/v2.0.0, etc.
+
+permissions:
+  contents: write   # for creating releases
+  packages: write   # for pushing images
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Parse tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          SERVICE="${TAG%%/v*}"
+          VERSION="${TAG#*/}"
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "service=$SERVICE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          echo "::notice::Releasing $SERVICE $VERSION"
+
+      - name: Find previous tag
+        id: prev
+        run: |
+          SERVICE="${{ steps.tag.outputs.service }}"
+          CURRENT_TAG="${{ steps.tag.outputs.tag }}"
+
+          # Find the most recent tag for this service before the current one
+          PREV_TAG=$(git tag -l "${SERVICE}/v*" \
+            | grep -v "^${CURRENT_TAG}$" \
+            | sort -V \
+            | tail -1 \
+            || echo "")
+
+          if [[ -z "$PREV_TAG" ]]; then
+            # First release — use initial commit
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD | head -1)
+            echo "::notice::First release for $SERVICE, diffing from initial commit"
+          else
+            echo "::notice::Previous tag: $PREV_TAG"
+          fi
+
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      # --- Build ---
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./services/${{ steps.tag.outputs.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/${{ steps.tag.outputs.service }}:${{ steps.tag.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}/${{ steps.tag.outputs.service }}:latest
+          cache-from: type=gha,scope=${{ steps.tag.outputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ steps.tag.outputs.service }}
+
+      # --- Changelog ---
+      - name: Generate changelog
+        id: changelog
+        run: |
+          chmod +x ./scripts/changelog.sh
+
+          ./scripts/changelog.sh \
+            --service "${{ steps.tag.outputs.service }}" \
+            --from "${{ steps.prev.outputs.prev_tag }}" \
+            --to "${{ steps.tag.outputs.tag }}" \
+            --format markdown \
+            > /tmp/release-notes.md
+
+          cat /tmp/release-notes.md
+
+      # --- Blast radius check ---
+      - name: Check shared dependency impact
+        run: |
+          chmod +x ./scripts/blast-radius.sh
+
+          echo "## Other services potentially affected" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+
+          # Check if this release includes shared changes that affect other services
+          affected=$(./scripts/blast-radius.sh \
+            --base "${{ steps.prev.outputs.prev_tag }}" \
+            --head "${{ steps.tag.outputs.tag }}" \
+            --format json \
+            --verbose 2>&1 || echo "[]")
+
+          # Filter out the current service
+          others=$(echo "$affected" | jq -r --arg svc "${{ steps.tag.outputs.service }}" \
+            '[.[] | select(. != $svc)] | if length == 0 then "None" else join(", ") end')
+
+          if [[ "$others" != "None" ]]; then
+            echo "⚠️ Shared dependencies changed. Consider also releasing: **${others}**" >> /tmp/release-notes.md
+          else
+            echo "✅ No other services affected by shared changes in this release." >> /tmp/release-notes.md
+          fi
+
+      # --- GitHub Release ---
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "${{ steps.tag.outputs.service }} ${{ steps.tag.outputs.version }}"
+          body_path: /tmp/release-notes.md
+          generate_release_notes: false
